@@ -40,7 +40,7 @@ func NewSSHServer(addr string, options ...ssh.Option) (*ssh.Server, error) {
 		ConnCallback: connectionWrapper(),
 		IdleTimeout:  1 * time.Minute,
 		RequestHandlers: map[string]ssh.RequestHandler{
-			tcpipForwardRequest: tcpipForwardRequestHandler(),
+			tcpipForwardRequest: tcpipForwardRequestHandler("0.0.0.0"),
 		},
 	}
 
@@ -87,7 +87,7 @@ func messageForwardingHandler() ssh.Handler {
 }
 
 // tcpipForwardRequestHandler returns an ssh.RequestHandler which handles SSH request of type "tcpip-forward"
-func tcpipForwardRequestHandler() ssh.RequestHandler {
+func tcpipForwardRequestHandler(bindAddr string) ssh.RequestHandler {
 	return func(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (ok bool, payload []byte) {
 		var err error
 
@@ -115,19 +115,17 @@ func tcpipForwardRequestHandler() ssh.RequestHandler {
 		}
 
 		var ln net.Listener
-		if request.BindPort != 22 && request.BindPort != 80 && request.BindPort != 443 {
-			addr := net.JoinHostPort(request.BindAddr, strconv.Itoa(int(request.BindPort)))
-			if ln, err = net.Listen("tcp", addr); err != nil {
+		if allowTCPForwarding(request.BindPort) {
+			if ln, err = tcpListen(bindAddr, request.BindPort); err != nil {
 				return false, []byte{}
-			} else {
-				messages <- fmt.Sprintf("forwarding traffic from %s", ln.Addr().String())
 			}
+			messages <- fmt.Sprintf("forwarding TCP traffic from %s", ln.Addr().String())
 		} else {
 			return false, []byte(fmt.Sprintf("forwarding %d not supported yet", request.BindPort))
 		}
 
 		// destination port could be different in case request.BindPort was '0' (zero)
-		_, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
+		destHost, destPortStr, _ := net.SplitHostPort(ln.Addr().String())
 		destPort, _ := strconv.Atoi(destPortStr)
 
 		// close listener once the ssh connection is closed
@@ -145,7 +143,7 @@ func tcpipForwardRequestHandler() ssh.RequestHandler {
 				OriginAddr string
 				OriginPort uint32
 			}{
-				DestAddr: request.BindAddr, DestPort: uint32(destPort),
+				DestAddr: destHost, DestPort: uint32(destPort),
 				OriginAddr: addr, OriginPort: uint32(p),
 			}
 
