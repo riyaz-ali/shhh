@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"github.com/gliderlabs/ssh"
+	"github.com/pkg/errors"
 	gossh "golang.org/x/crypto/ssh"
 	"io"
 	"net"
@@ -25,6 +26,9 @@ const (
 	// for incoming request on a forwarded port
 	tcpipForwardIncomingConnectionRequest = "forwarded-tcpip"
 )
+
+// newChannelFn defines signature for a helper function which opens a new ssh channel for incoming requests on forwarded port
+type newChannelFn func(host, port string) (gossh.Channel, <-chan *gossh.Request, error)
 
 // NewSSHServer returns a new ssh.Server instance with configured defaults
 // for handling port forwarding and additional secure defaults
@@ -77,7 +81,7 @@ func messageForwardingHandler() ssh.Handler {
 		}
 
 		for msg := range messages {
-			_, _ = io.WriteString(s, fmt.Sprintf("%s\n", msg))
+			_, _ = io.WriteString(s, fmt.Sprintf("server: %s\n", msg))
 		}
 	}
 }
@@ -132,56 +136,81 @@ func tcpipForwardRequestHandler() ssh.RequestHandler {
 			_ = ln.Close()
 		}()
 
-		go func() {
-			for {
-				var err error
-
-				c, err := ln.Accept()
-				if err != nil {
-					messages <- "error occurred while accepting connection\n"
-					break
-				}
-				originAddr, originPortStr, _ := net.SplitHostPort(c.RemoteAddr().String())
-				originPort, _ := strconv.Atoi(originPortStr)
-
-				var forward = struct {
-					DestAddr   string
-					DestPort   uint32
-					OriginAddr string
-					OriginPort uint32
-				}{
-					DestAddr: request.BindAddr, DestPort: uint32(destPort),
-					OriginAddr: originAddr, OriginPort: uint32(originPort),
-				}
-				payload := gossh.Marshal(&forward)
-
-				// send notification to client
-				messages <- fmt.Sprintf("accepted connection from %s:%d", originAddr, originPort)
-
-				ch, reqs, err := sshConnection.OpenChannel(tcpipForwardIncomingConnectionRequest, payload)
-				if err != nil {
-					messages <- "error occurred while forwarding connection"
-					c.Close()
-					break
-				}
-
-				go gossh.DiscardRequests(reqs)
-				go func() {
-					defer ch.Close()
-					defer c.Close()
-					_, _ = io.Copy(ch, c)
-				}()
-				go func() {
-					defer ch.Close()
-					defer c.Close()
-					_, _ = io.Copy(c, ch)
-				}()
+		// helper to open a new ssh channel to handle new incoming connection
+		var newChannel = func(addr, port string) (gossh.Channel, <-chan *gossh.Request, error) {
+			p, _ := strconv.Atoi(port)
+			var forward = struct {
+				DestAddr   string
+				DestPort   uint32
+				OriginAddr string
+				OriginPort uint32
+			}{
+				DestAddr: request.BindAddr, DestPort: uint32(destPort),
+				OriginAddr: addr, OriginPort: uint32(p),
 			}
 
-			close(messages) // to close the session as well
+			return sshConnection.OpenChannel(tcpipForwardIncomingConnectionRequest, gossh.Marshal(&forward))
+		}
+
+		// helper to send notification messages to client
+		var notifier = func(msg string) {
+			messages <- msg
+		}
+
+		go func() {
+			defer close(messages) // to close the session as well
+			if err := tcpipForwardConnectionHandler(ln, notifier, newChannel); err != nil {
+				messages <- fmt.Sprintf("error occurred while processing: %s", err.Error())
+			}
 		}()
 
 		var response = struct{ BindPort uint32 }{uint32(destPort)}
 		return true, gossh.Marshal(&response)
+	}
+}
+
+// tcpipForwardConnectionHandler handles request cycle for a port forwarded connection.
+// It listens for, accepts and handles connection processing.
+func tcpipForwardConnectionHandler(ln net.Listener, notify func(string), newChannel newChannelFn) error {
+	for { // process connections for eternity...
+		var err error
+
+		// accept a new connection
+		var conn net.Conn
+		if conn, err = ln.Accept(); err != nil {
+			if oe, ok := err.(*net.OpError); ok {
+				if oe.Timeout() || oe.Temporary() {
+					continue
+				}
+			}
+			return errors.Wrap(err, "failed to accept new connection")
+		}
+
+		addr, port, _ := net.SplitHostPort(conn.RemoteAddr().String())
+		notify(fmt.Sprintf("accepted connection from %s:%s", addr, port))
+
+		// open new channel to forward traffic
+		var channel gossh.Channel
+		var requests <-chan *gossh.Request
+		if channel, requests, err = newChannel(addr, port); err != nil {
+			notify(fmt.Sprintf("error occurred while processing: %s", err.Error()))
+		}
+
+		// we don't need to serve any request on the new channel
+		go gossh.DiscardRequests(requests)
+
+		// copy from channel to connection
+		go func() {
+			defer channel.Close()
+			defer conn.Close()
+			_, _ = io.Copy(channel, conn)
+		}()
+
+		// copy from connection to channel
+		go func() {
+			defer channel.Close()
+			defer conn.Close()
+			_, _ = io.Copy(conn, channel)
+		}()
 	}
 }
